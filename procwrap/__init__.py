@@ -1,5 +1,5 @@
 from __future__ import absolute_import
 
-from .procwrap import procwrap
+from .procwrap import ProcessWrapper
 
-__all__ = ["procwrap"]
+__all__ = ["ProcessWrapper"]
