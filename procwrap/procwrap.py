@@ -4,12 +4,18 @@ import os
 import sys
 import time
 import json
+import Queue
 import atexit
 import requests
 import argparse
+import datetime
+import threading
 import subprocess
-
+from uuid import uuid1
 from basescript import BaseScript
+
+# TODO make this configurable ?
+NSQ_MAX_CONTENT_LENGTH = 1024 * 1024 # 1 MB
 
 class ProcessWrapper(BaseScript):
     DESC = "process wrapper"
@@ -21,6 +27,13 @@ class ProcessWrapper(BaseScript):
         if not self.args.enable_nsq:
             return
 
+        self.init_nsq()
+
+    def init_nsq(self):
+        """
+        if --enable-nsq is provided, initialize the nsq
+        """
+
         addr = self.args.nsqd_http_address
         addr = addr.rstrip('/')
         if not addr.startswith('http://'):
@@ -28,17 +41,87 @@ class ProcessWrapper(BaseScript):
 
         self.args.nsqd_http_address = addr
 
-        session = requests.Session()
-        response = session.get('%s/ping') % addr
+        response = requests.get('%s/ping' % self.args.nsqd_http_address)
         if response.status_code != 200:
             raise Exception("bad response %s" % response)
 
-        url = '%s/ping' % self.args.nsqd_http_address
-        self.write_to_nsq = lambda msg: session.post(
-                url, data=msg, params={'topic': self.args.nsq_log_topic},
-            )
+        # TODO make queuesize configurable
+        queue = Queue.Queue(maxsize=1000)
+        # block until you can write it to the queue
+        self.write_to_nsq = lambda msg: queue.put(msg, block=True, timeout=None)
 
-        self.log.info("pushing logs to nsq", url=url, topic=self.args.nsq_log_topic)
+        self.queue = queue
+        self.nsq_publish_thread = threading.Thread(target=self._publish_to_nsq)
+        self.nsq_publish_thread.daemon = True
+        self.keeprunning = threading.Event()
+        self.keeprunning.set()
+
+        self.nsq_publish_thread.start()
+
+    def _publish_to_nsq(self):
+        url = '%s/mpub' % self.args.nsqd_http_address
+        topic = self.args.nsq_log_topic
+        self.log.info("pushing logs to nsq", url=url, topic=topic)
+
+        # TODO make this configurable
+        interval = 5 # every five seconds or nsq max content length
+        dt_interval = datetime.timedelta(seconds=interval)
+
+        buf = []
+        size = 0
+        last_send = datetime.datetime.now() - datetime.timedelta(seconds=100)
+
+        session = requests.Session()
+        params = { 'topic': topic }
+
+        keeprunning = self.keeprunning
+        queue = self.queue
+
+        keeprunning.wait()
+        while keeprunning.is_set():
+            now = datetime.datetime.now()
+            try:
+                msg = queue.get(block=True, timeout=interval)
+                size += len(msg)
+                buf.append(msg)
+            except Queue.Empty:
+                pass
+
+            if size < NSQ_MAX_CONTENT_LENGTH and (now - last_send) < dt_interval:
+                continue
+
+            if len(buf) == 0:
+                continue
+
+            # NOTE buf cannot have \n in it. json escapes \n so thats fine.
+            try:
+                self.log.debug("sending logs to nsq", num_logs=len(buf))
+
+                data = '\n'.join(buf)
+                resp = session.post(url, data=data, params=params)
+                if resp.status_code != 200:
+                    raise Exception("bad response %s sending to nsq" % resp)
+
+                last_send = now
+                buf = []
+                size = 0
+
+            except:
+                self.log.exception("failed to send to nsq")
+
+        # sending whatever is remaining
+        if len(buf) != 0:
+            try:
+                self.log.debug("sending remaining logs to nsq", num_logs=len(buf))
+                data = '\n'.join(buf)
+                resp = session.post(url, data=data, params=params)
+                if resp.status_code != 200:
+                    raise Exception("bad response %s sending to nsq" % resp)
+
+            except:
+                self.log.exception("failed to send to nsq...")
+
+        self.log.warning("stopped sending logs to nsq")
 
     def run(self):
         self.pre_run_init()
@@ -49,26 +132,28 @@ class ProcessWrapper(BaseScript):
             self.args.command, bufsize=1, universal_newlines=True,
             stderr=subprocess.PIPE,
         )
-        atexit.register(self._on_exit)
 
         self.log.info("process started", pid=self.process.pid)
         read_stderr_line = self.process.stderr.readline
         poll = self.process.poll
 
-        # TODO bufferring and sending many to nsq together
+        hostname = self.hostname # from basescript
         while poll() is None:
             line = read_stderr_line()
 
             try:
                 jline = json.loads(line)
-                # TODO check that it is really a log
-                # TODO send hostname, uuid, timestamp etc.
 
-                # NOTE not using standard log levels because we want this to be transparent
                 level = jline.get("level", "debug")
                 event = jline.pop("event", "")
+                # NOTE not using standard log levels because we want this to be transparent
                 self.log._proxy_to_logger(level, event, **jline)
-                self.write_to_nsq(line)
+
+                jline['event'] = event
+                jline['uuid'] = str(uuid1())
+                jline['host'] = hostname
+                # we can get the timestamp from the uuid itself, so no need for timestamp
+                self.write_to_nsq(json.dumps(jline))
 
             except ValueError:
                 sys.stderr.write(line)
@@ -81,15 +166,22 @@ class ProcessWrapper(BaseScript):
 
         sys.exit(self.process.returncode)
 
-    def _on_exit(self):
+    def on_exit(self):
         # TODO grace period ?
         # TODO make sure all signals go to child process.
         # TODO propagate signals properly ? atexit is being called before signal is sent to child
 
-        poll = self.process.poll()
-        if poll is None:
-            self.log.warning("killing child process", pid=self.process.pid)
-            self.process.terminate()
+        if self.process is not None:
+            poll = self.process.poll()
+            if poll is None:
+                self.log.warning("killing child process", pid=self.process.pid)
+                self.process.terminate()
+
+        if self.args.enable_nsq:
+            # nsq was enabled
+            self.log.info("waiting to publish remaining logs to nsq...")
+            self.keeprunning.clear()
+            self.nsq_publish_thread.join()
 
     def define_args(self, parser):
         super(ProcessWrapper, self).define_args(parser)
@@ -110,7 +202,9 @@ class ProcessWrapper(BaseScript):
         )
 
 def main():
-    ProcessWrapper().start()
+    pw = ProcessWrapper()
+    atexit.register(pw.on_exit)
+    pw.start()
 
 if __name__ == '__main__':
     main()
