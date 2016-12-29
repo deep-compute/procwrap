@@ -35,6 +35,7 @@ setup(
     download_url="https://github.com/deep-compute/procwrap/tarball/%s" % version,
     license='MIT License',
     install_requires=[
+        "basescript",
         "requests",
     ],
     package_dir={'procwrap': 'procwrap'},
