@@ -12,10 +12,8 @@ import datetime
 import threading
 import subprocess
 from uuid import uuid1
+from urlparse import urljoin
 from basescript import BaseScript
-
-# TODO make this configurable ?
-NSQ_MAX_CONTENT_LENGTH = 1024 * 1024 # 1 MB
 
 class ProcessWrapper(BaseScript):
     DESC = "process wrapper"
@@ -34,14 +32,12 @@ class ProcessWrapper(BaseScript):
         if --enable-nsq is provided, initialize the nsq
         """
 
-        addr = self.args.nsqd_http_address
-        addr = addr.rstrip('/')
-        if not addr.startswith('http://'):
-            addr = 'http://%s' % addr
+        if not self.args.nsqd_http_address.startswith('http'):
+            self.args.nsqd_http_address = 'http://%s' % self.args.nsqd_http_address
 
-        self.args.nsqd_http_address = addr
 
-        response = requests.get('%s/ping' % self.args.nsqd_http_address)
+        url = urljoin(self.args.nsqd_http_address, '/ping')
+        response = requests.get(url)
         if response.status_code != 200:
             raise Exception("bad response %s" % response)
 
@@ -59,17 +55,17 @@ class ProcessWrapper(BaseScript):
         self.nsq_publish_thread.start()
 
     def _publish_to_nsq(self):
-        url = '%s/mpub' % self.args.nsqd_http_address
+        url = urljoin(self.args.nsqd_http_address, '/mpub')
         topic = self.args.nsq_log_topic
         self.log.info("pushing logs to nsq", url=url, topic=topic)
 
-        # TODO make this configurable
-        interval = 5 # every five seconds or nsq max content length
-        dt_interval = datetime.timedelta(seconds=interval)
+        max_content_length = self.args.nsq_max_content_length
+        interval = datetime.timedelta(milliseconds=self.args.nsq_log_interval)
+        queue_get_timeout = interval.total_seconds()
 
         buf = []
         size = 0
-        last_send = datetime.datetime.now() - datetime.timedelta(seconds=100)
+        last_send = datetime.datetime.now() - (100 * interval)
 
         session = requests.Session()
         params = { 'topic': topic }
@@ -81,13 +77,13 @@ class ProcessWrapper(BaseScript):
         while keeprunning.is_set():
             now = datetime.datetime.now()
             try:
-                msg = queue.get(block=True, timeout=interval)
+                msg = queue.get(block=True, timeout=queue_get_timeout)
                 size += len(msg)
                 buf.append(msg)
             except Queue.Empty:
                 pass
 
-            if size < NSQ_MAX_CONTENT_LENGTH and (now - last_send) < dt_interval:
+            if size < max_content_length and (now - last_send) < interval:
                 continue
 
             if len(buf) == 0:
@@ -196,7 +192,20 @@ class ProcessWrapper(BaseScript):
             default="http://127.0.0.1:4151",
             help="nsqd http address, default: %(default)s",
         )
-
+        parser.add_argument("--nsq-log-interval",
+            type=int,
+            default=500,
+            help=(
+                "number of milliseconds to buffer before pushing logs, "
+                "default: %(default)s"),
+        )
+        parser.add_argument("--nsq-max-content-length",
+            type=int,
+            default=1024 * 1024,
+            help=(
+                "number of bytes to buffer before pushing logs to nsq, "
+                "default: %(default)s"),
+        )
         parser.add_argument("command", nargs=argparse.REMAINDER,
             help="the command to run",
         )
