@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import atexit
 import requests
 import argparse
 import subprocess
@@ -48,6 +49,7 @@ class ProcessWrapper(BaseScript):
             self.args.command, bufsize=1, universal_newlines=True,
             stderr=subprocess.PIPE,
         )
+        atexit.register(self._on_exit)
 
         self.log.info("process started", pid=self.process.pid)
         read_stderr_line = self.process.stderr.readline
@@ -78,6 +80,16 @@ class ProcessWrapper(BaseScript):
         sys.stderr.flush()
 
         sys.exit(self.process.returncode)
+
+    def _on_exit(self):
+        # TODO grace period ?
+        # TODO make sure all signals go to child process.
+        # TODO propagate signals properly ? atexit is being called before signal is sent to child
+
+        poll = self.process.poll()
+        if poll is None:
+            self.log.warning("killing child process", pid=self.process.pid)
+            self.process.terminate()
 
     def define_args(self, parser):
         super(ProcessWrapper, self).define_args(parser)
