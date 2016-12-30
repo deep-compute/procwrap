@@ -145,32 +145,64 @@ class ProcessWrapper(BaseScript):
         poll = self.process.poll
 
         hostname = self.hostname # from basescript
-        while poll() is None:
-            line = read_stderr_line()
+
+        non_json = [ 0, [] ]
+        def write_non_json():
+            event = ''.join(non_json[1])
+            jevent = {
+                "level": "error", "uuid": str(uuid1()),
+                "host": hostname, "event": event, "raw_stderr": True,
+            }
+            self.write_to_nsq(json.dumps(jevent))
+            non_json[0] = 0
+            non_json[1] = []
+
+        def on_line(line):
+            jline = None
+            should_write_non_json = False
 
             try:
                 jline = json.loads(line)
-
-                level = jline.get("level", "debug")
-                event = jline.pop("event", "")
-                # NOTE not using standard log levels because we want this to be transparent
-                self.log._proxy_to_logger(level, event, **jline)
-
-                jline['event'] = event
-                jline['uuid'] = str(uuid1())
-                jline['host'] = hostname
-                # we can get the timestamp from the uuid itself, so no need for timestamp
-                self.write_to_nsq(json.dumps(jline))
+                if non_json[0] != 0:
+                    should_write_non_json = True
 
             except ValueError:
                 sys.stderr.write(line)
+                non_json[0] += len(line)
+                non_json[1].append(line)
+                if non_json[0] > self.args.nsq_max_content_length:
+                    should_write_non_json = True
+
+            if should_write_non_json:
+                write_non_json()
+
+            if jline is None:
+                return
+
+            level = jline.get("level", "debug")
+            event = jline.pop("event", "")
+            # NOTE not using standard log levels because we want this to be transparent
+            self.log._proxy_to_logger(level, event, **jline)
+
+            jline['event'] = event
+            jline['uuid'] = str(uuid1())
+            jline['host'] = hostname
+            # we can get the timestamp from the uuid itself, so no need for timestamp
+            self.write_to_nsq(json.dumps(jline))
+
+        while poll() is None:
+            line = read_stderr_line()
+            on_line(line)
 
         # read the remaining stderr
         remaining = self.process.stderr.read()
-        # TODO this should be processed as well
-        sys.stderr.write(remaining)
-        sys.stderr.flush()
+        for line in remaining.split('\n'):
+            on_line(line)
 
+        if non_json[0] != 0:
+            write_non_json()
+
+        sys.stderr.flush()
         sys.exit(self.process.returncode)
 
     def on_exit(self):
