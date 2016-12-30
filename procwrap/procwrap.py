@@ -38,9 +38,21 @@ class ProcessWrapper(BaseScript):
 
 
         url = urljoin(self.args.nsqd_http_address, '/ping')
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise Exception("bad response %s" % response)
+        retries = 0
+        while True:
+            try:
+                response = requests.get(url)
+                if response.status_code != 200:
+                    raise Exception("bad response %s" % response)
+                break
+
+            except:
+                retries += 1
+                self.log.exception("failed to ping nsqd")
+                if retries > 30:
+                    raise
+
+            time.sleep(60)
 
         # TODO make queuesize configurable
         queue = Queue.Queue(maxsize=1000)
