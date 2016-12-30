@@ -6,6 +6,7 @@ import time
 import json
 import Queue
 import atexit
+import signal
 import requests
 import argparse
 import datetime
@@ -123,10 +124,20 @@ class ProcessWrapper(BaseScript):
         self.pre_run_init()
         self.log.info('starting process', command=self.args.command)
 
+        def become_tty_fg():
+            # make child process use the fg
+            # http://stackoverflow.com/questions/15200700/how-do-i-set-the-terminal-foreground-process-group-for-a-process-im-running-und
+            os.setpgrp()
+            hdlr = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            tty = os.open('/dev/tty', os.O_RDWR)
+            os.tcsetpgrp(tty, os.getpgrp())
+            signal.signal(signal.SIGTTOU, hdlr)
+
         # TODO atexit handler to kill this
         self.process = subprocess.Popen(
             self.args.command, bufsize=1, universal_newlines=True,
             stderr=subprocess.PIPE,
+            preexec_fn=become_tty_fg,
         )
 
         self.log.info("process started", pid=self.process.pid)
